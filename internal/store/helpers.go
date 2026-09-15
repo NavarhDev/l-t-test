@@ -154,6 +154,11 @@ type CostumeRef struct {
 	CharacterId int32
 }
 
+type CompanionEnhancedRef struct {
+	CompanionId int32
+	Level       int32
+}
+
 type WeaponRef struct {
 	WeaponSkillGroupId                 int32
 	WeaponAbilityGroupId               int32
@@ -184,11 +189,12 @@ type PartsStatusSubDef struct {
 }
 
 type PossessionGranter struct {
-	CostumeById        map[int32]CostumeRef
-	WeaponById         map[int32]WeaponRef
-	WeaponSkillSlots   map[int32][]int32
-	WeaponAbilitySlots map[int32][]int32
-	ReleaseConditions  map[int32][]WeaponStoryReleaseCond
+	CostumeById           map[int32]CostumeRef
+	CompanionEnhancedById map[int32]CompanionEnhancedRef
+	WeaponById            map[int32]WeaponRef
+	WeaponSkillSlots      map[int32][]int32
+	WeaponAbilitySlots    map[int32][]int32
+	ReleaseConditions     map[int32][]WeaponStoryReleaseCond
 
 	PartsById                            map[int32]PartsRef
 	DefaultPartsStatusMainByLotteryGroup map[int32]int32
@@ -226,8 +232,14 @@ func (g *PossessionGranter) GrantFull(user *UserState, possessionType model.Poss
 		g.GrantCostume(user, possessionId, nowMillis)
 	case model.PossessionTypeWeapon, model.PossessionTypeWeaponEnhanced:
 		g.GrantWeapon(user, possessionId, nowMillis)
-	case model.PossessionTypeCompanion, model.PossessionTypeCompanionEnhanced:
+	case model.PossessionTypeCompanion:
 		g.GrantCompanion(user, possessionId, nowMillis)
+	case model.PossessionTypeCompanionEnhanced:
+		enhanced, ok := g.CompanionEnhancedById[possessionId]
+		if !ok {
+			return
+		}
+		g.grantCompanion(user, enhanced.CompanionId, enhanced.Level, nowMillis)
 	case model.PossessionTypeParts, model.PossessionTypePartsEnhanced:
 		g.GrantParts(user, possessionId, nowMillis)
 	default:
@@ -271,6 +283,10 @@ func (g *PossessionGranter) GrantCostume(user *UserState, costumeId int32, nowMi
 }
 
 func (g *PossessionGranter) GrantCompanion(user *UserState, companionId int32, nowMillis int64) {
+	g.grantCompanion(user, companionId, 1, nowMillis)
+}
+
+func (g *PossessionGranter) grantCompanion(user *UserState, companionId, level int32, nowMillis int64) {
 	for _, row := range user.Companions {
 		if row.CompanionId == companionId {
 			return
@@ -280,7 +296,7 @@ func (g *PossessionGranter) GrantCompanion(user *UserState, companionId int32, n
 	user.Companions[key] = CompanionState{
 		UserCompanionUuid:   key,
 		CompanionId:         companionId,
-		Level:               1,
+		Level:               level,
 		HeadupDisplayViewId: 1,
 		AcquisitionDatetime: nowMillis,
 	}

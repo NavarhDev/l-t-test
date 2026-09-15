@@ -106,8 +106,9 @@ type QuestCatalog struct {
 	CostumeMaxLevelByRarity map[int32]NumericalFunc
 	MaxStaminaByLevel       map[int32]int32
 
-	CostumeById map[int32]EntityMCostume
-	WeaponById  map[int32]EntityMWeapon
+	CostumeById           map[int32]EntityMCostume
+	CompanionEnhancedById map[int32]EntityMCompanionEnhanced
+	WeaponById            map[int32]EntityMWeapon
 
 	// WeaponAttributeById maps WeaponId to its AttributeType (element).
 	WeaponAttributeById map[int32]int32
@@ -396,6 +397,11 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 		return nil, fmt.Errorf("load costume table: %w", err)
 	}
 
+	companionEnhancedRows, err := utils.ReadTable[EntityMCompanionEnhanced]("m_companion_enhanced")
+	if err != nil {
+		return nil, fmt.Errorf("load enhanced companion table: %w", err)
+	}
+
 	costumeRarities, err := utils.ReadTable[EntityMCostumeRarity]("m_costume_rarity")
 	if err != nil {
 		return nil, fmt.Errorf("load costume rarity table: %w", err)
@@ -521,6 +527,11 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 	costumeById := make(map[int32]EntityMCostume, len(costumeMasters))
 	for _, cm := range costumeMasters {
 		costumeById[cm.CostumeId] = cm
+	}
+
+	companionEnhancedById := make(map[int32]EntityMCompanionEnhanced, len(companionEnhancedRows))
+	for _, enhanced := range companionEnhancedRows {
+		companionEnhancedById[enhanced.CompanionEnhancedId] = enhanced
 	}
 
 	weaponById := make(map[int32]EntityMWeapon, len(weapons))
@@ -965,9 +976,10 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 		CostumeMaxLevelByRarity: costumeMaxLevelByRarity,
 		MaxStaminaByLevel:       maxStaminaByLevel,
 
-		CostumeById:         costumeById,
-		WeaponById:          weaponById,
-		WeaponAttributeById: weaponAttributeById,
+		CostumeById:           costumeById,
+		CompanionEnhancedById: companionEnhancedById,
+		WeaponById:            weaponById,
+		WeaponAttributeById:   weaponAttributeById,
 
 		WeaponSkillSlots:   skillSlots,
 		WeaponAbilitySlots: abilitySlots,
