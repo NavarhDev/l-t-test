@@ -375,7 +375,7 @@ func (h *QuestHandler) evaluateFinishOutcome(user *store.UserState, questId int3
 	}
 
 	drops := h.computeDropRewards(questDef, target, nowMillis)
-	outcome.DropRewards = h.applyImportantItemDropBonuses(drops, user.ImportantItems, target)
+	outcome.DropRewards = h.applyImportantItemDropBonuses(drops, user.ImportantItems, target, nowMillis)
 	
 	// Convert tickets before scaling and display
 	var convertedDrops []RewardGrant
@@ -964,6 +964,7 @@ func (h *QuestHandler) applyImportantItemDropBonuses(
 	drops []RewardGrant,
 	userImportantItems map[int32]int32,
 	target campaign.QuestTarget,
+	nowMillis int64,
 ) []RewardGrant {
 	if h.ImportantItems == nil {
 		return drops
@@ -983,11 +984,11 @@ func (h *QuestHandler) applyImportantItemDropBonuses(
 		masterTarget.Difficulty = h.ImportantItems.MainQuestDifficultyByQuestId[target.QuestId]
 	}
 
-	// Sum the permil bonus of every matching effect per drop, then apply once
-	// with probabilistic rounding. Applying each effect separately with
-	// truncating integer division silently discarded every sub-100% bonus on
-	// count-1 drops (1 * 1500 / 1000 = 1), which is what almost all wired drop
-	// rows are.
+	// Sum the permil bonus of every matching *active* effect per drop, then
+	// apply once with probabilistic rounding. Applying each effect separately
+	// with truncating integer division silently discarded every sub-100% bonus
+	// on count-1 drops (1 * 1500 / 1000 = 1), which is what almost all wired
+	// drop rows are.
 	permilByDrop := make([]int32, len(drops))
 	for itemId, count := range userImportantItems {
 		if count <= 0 {
@@ -998,6 +999,9 @@ func (h *QuestHandler) applyImportantItemDropBonuses(
 			continue
 		}
 		for _, eff := range effects {
+			if !eff.Active(nowMillis) {
+				continue
+			}
 			permil := eff.Permil()
 			if permil == 0 || !eff.QuestMatches(masterTarget) {
 				continue

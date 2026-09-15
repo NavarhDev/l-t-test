@@ -51,6 +51,8 @@ type ImportantItemDropEffect struct {
 	RatePermil   int32 // from m_important_item_effect_drop_rate
 	QuestFilters []importantItemQuestFilter
 	ItemFilter   map[importantItemPossKey]bool // empty = all items
+	StartMillis  int64                         // effect.StartDatetime (inclusive)
+	EndMillis    int64                         // effect.EndDatetime (inclusive); 0 = no upper bound
 }
 
 type importantItemQuestFilter struct{ groupType, value int32 }
@@ -69,6 +71,8 @@ func LoadImportantItemCatalog() *ImportantItemCatalog {
 		EffectByItemId:               map[int32][]ImportantItemDropEffect{},
 		MainQuestDifficultyByQuestId: map[int32]int32{},
 	}
+
+	var skipped int // broken / unsupported effects that were silently skipped
 
 	items, err := utils.ReadTable[EntityMImportantItem]("m_important_item")
 	if err != nil {
@@ -153,24 +157,48 @@ func LoadImportantItemCatalog() *ImportantItemCatalog {
 			case ImportantItemEffectTypeDropCount:
 				dc, ok := dcById[eff.ImportantItemEffectTargetId]
 				if !ok {
+					skipped++
+					log.Printf("[ImportantItemCatalog] skip item=%d effect=%d: missing drop-count target %d",
+						item.ImportantItemId, eff.ImportantItemEffectId, eff.ImportantItemEffectTargetId)
 					continue
 				}
 				resolved = ImportantItemDropEffect{
 					CountPermil:  dc.CountPermil,
 					QuestFilters: questGroups[dc.ImportantItemEffectTargetQuestGroupId],
 					ItemFilter:   itemSets[dc.ImportantItemEffectTargetItemGroupId],
+					StartMillis:  eff.StartDatetime,
+					EndMillis:    eff.EndDatetime,
+				}
+				if len(resolved.QuestFilters) == 0 {
+					skipped++
+					log.Printf("[ImportantItemCatalog] skip item=%d effect=%d: empty quest-target group %d",
+						item.ImportantItemId, eff.ImportantItemEffectId, dc.ImportantItemEffectTargetQuestGroupId)
+					continue
 				}
 			case ImportantItemEffectTypeDropRate:
 				dr, ok := drById[eff.ImportantItemEffectTargetId]
 				if !ok {
+					skipped++
+					log.Printf("[ImportantItemCatalog] skip item=%d effect=%d: missing drop-rate target %d",
+						item.ImportantItemId, eff.ImportantItemEffectId, eff.ImportantItemEffectTargetId)
 					continue
 				}
 				resolved = ImportantItemDropEffect{
 					RatePermil:   dr.RatePermil,
 					QuestFilters: questGroups[dr.ImportantItemEffectTargetQuestGroupId],
 					ItemFilter:   itemSets[dr.ImportantItemEffectTargetItemGroupId],
+					StartMillis:  eff.StartDatetime,
+					EndMillis:    eff.EndDatetime,
+				}
+				if len(resolved.QuestFilters) == 0 {
+					skipped++
+					log.Printf("[ImportantItemCatalog] skip item=%d effect=%d: empty quest-target group %d",
+						item.ImportantItemId, eff.ImportantItemEffectId, dr.ImportantItemEffectTargetQuestGroupId)
+					continue
 				}
 			default:
+				// UnlockFunction and any unknown types are intentionally ignored
+				// (client-side only or unsupported).
 				continue
 			}
 			cat.EffectByItemId[item.ImportantItemId] = append(cat.EffectByItemId[item.ImportantItemId], resolved)
@@ -198,8 +226,21 @@ func LoadImportantItemCatalog() *ImportantItemCatalog {
 		}
 	}
 
-	log.Printf("[ImportantItemCatalog] loaded: %d items with drop effects", len(cat.EffectByItemId))
+	log.Printf("[ImportantItemCatalog] loaded: %d items with drop effects, %d broken/unsupported effects skipped",
+		len(cat.EffectByItemId), skipped)
 	return cat
+}
+
+// Active reports whether the effect is within its valid time window.
+// EndMillis == 0 means no upper bound (open-ended).
+func (e *ImportantItemDropEffect) Active(nowMillis int64) bool {
+	if nowMillis < e.StartMillis {
+		return false
+	}
+	if e.EndMillis > 0 && nowMillis > e.EndMillis {
+		return false
+	}
+	return true
 }
 
 // QuestMatches reports whether target is covered by this effect's quest
@@ -259,10 +300,10 @@ func (e *ImportantItemDropEffect) ItemMatches(possType, possId int32) bool {
 	return e.ItemFilter[key]
 }
 
-// Permil returns the drop bonus in parts per thousand (CountPermil and
-// RatePermil are mutually exclusive per row, but summing is safe regardless).
-// Application — including rounding of the fractional part — happens in
-// questflow after the permils of every matching effect are summed.
+// Permil returns the combined drop bonus in parts per thousand.
+// RatePermil and CountPermil are mutually exclusive per master-data row, but
+// summing is safe when multiple effects stack. Application (including
+// probabilistic rounding of the fractional part) happens in questflow.
 func (e *ImportantItemDropEffect) Permil() int32 {
 	return e.CountPermil + e.RatePermil
 }

@@ -851,7 +851,7 @@ func (h *QuestHandler) HandleQuestSkip(user *store.UserState, questId, skipCount
 	var allDrops []RewardGrant
 	for range skipCount {
 		drops := h.computeDropRewards(questDef, target, nowMillis)
-		drops = h.applyImportantItemDropBonuses(drops, user.ImportantItems, target)
+		drops = h.applyImportantItemDropBonuses(drops, user.ImportantItems, target, nowMillis)
 		// Mirror the finish path: drops are scaled (gem bonus) exactly as on a
 		// normal clear, so skipping never pays out less than playing.
 		for i := range drops {
