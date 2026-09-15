@@ -30,6 +30,7 @@ type Catalogs struct {
 	GameConfig        *masterdata.GameConfig
 	Parts             *masterdata.PartsCatalog
 	Quest             *masterdata.QuestCatalog
+	LimitContent      *masterdata.LimitContentCatalog
 	GachaEntries      []store.GachaCatalogEntry
 	GachaMedals       map[int32]masterdata.GachaMedalInfo
 	GachaPool         *masterdata.GachaCatalog

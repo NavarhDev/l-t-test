@@ -427,9 +427,11 @@ func (s *QuestServiceServer) ResetLimitContentQuestProgress(ctx context.Context,
 	log.Printf("[QuestService] ResetLimitContentQuestProgress: eventQuestChapterId=%d questId=%d",
 		req.EventQuestChapterId, req.QuestId)
 
+	cat := s.holder.Get()
 	userId := CurrentUserId(ctx, s.users, s.sessions)
 	nowMillis := gametime.NowMillis()
 	s.users.UpdateUser(userId, func(user *store.UserState) {
+		// Legacy side-story path (kept for compatibility).
 		if _, exists := user.SideStoryQuests[req.QuestId]; exists {
 			user.SideStoryQuests[req.QuestId] = store.SideStoryQuestProgress{
 				HeadSideStoryQuestSceneId: 0,
@@ -437,12 +439,51 @@ func (s *QuestServiceServer) ResetLimitContentQuestProgress(ctx context.Context,
 				LatestVersion:             nowMillis,
 			}
 		}
-
-		delete(user.QuestLimitContentStatus, req.QuestId)
-
 		if user.SideStoryActiveProgress.CurrentSideStoryQuestId == req.QuestId {
 			user.SideStoryActiveProgress = store.SideStoryActiveProgress{
 				LatestVersion: nowMillis,
+			}
+		}
+
+		// Recollections of Dusk: reset the whole difficulty (floor) containing questId.
+		questIds := []int32{req.QuestId}
+		if cat != nil && cat.Quest != nil {
+			for _, ids := range cat.Quest.EventQuestIdsByChapterDifficulty[req.EventQuestChapterId] {
+				for _, id := range ids {
+					if id == req.QuestId {
+						questIds = append([]int32(nil), ids...)
+						goto foundDifficulty
+					}
+				}
+			}
+		}
+	foundDifficulty:
+
+		for _, id := range questIds {
+			if q, ok := user.Quests[id]; ok {
+				q.QuestStateType = model.UserQuestStateTypeUnknown
+				q.UserDeckNumber = 0
+				user.Quests[id] = q
+			} else {
+				user.Quests[id] = store.UserQuestState{
+					QuestId:        id,
+					QuestStateType: model.UserQuestStateTypeUnknown,
+				}
+			}
+			delete(user.QuestLimitContentStatus, id)
+		}
+
+		if user.DeckLimitContentRestricted != nil {
+			for id, restricted := range user.DeckLimitContentRestricted {
+				if restricted.EventQuestChapterId != req.EventQuestChapterId {
+					continue
+				}
+				for _, qid := range questIds {
+					if restricted.QuestId == qid {
+						delete(user.DeckLimitContentRestricted, id)
+						break
+					}
+				}
 			}
 		}
 	})

@@ -56,6 +56,13 @@ type QuestCatalog struct {
 	BattleOnlyTargetSceneByQuestId     map[int32]int32
 	MainQuestChapterIdByQuestId        map[int32]int32
 	EventQuestTypeByChapterId          map[int32]int32
+	EventQuestIdsByChapterId           map[int32][]int32
+	EventQuestIdsByChapterDifficulty   map[int32]map[int32][]int32 // chapterId -> difficulty -> questIds
+	LimitContentQuestIds               map[int32]bool
+	// DeckRestrictionsByGroupId maps QuestDeckRestrictionGroupId -> slot restrictions.
+	DeckRestrictionsByGroupId map[int32][]EntityMQuestDeckRestrictionGroup
+	// CostumeProperAttributeByCostumeId maps CostumeId -> CostumeProperAttributeType (affinity).
+	CostumeProperAttributeByCostumeId map[int32]int32
 	// DarkMemoryQuestIds contains all quest IDs in the Dark Memory master-data
 	// namespace. This series contains every character's quest stages and their
 	// difficulty subgroups.
@@ -109,6 +116,87 @@ type QuestCatalog struct {
 	WeaponAbilitySlots map[int32][]int32
 
 	*PartsCatalog
+}
+
+
+func buildEventQuestIndexes(
+	chapters []EntityMEventQuestChapter,
+	groups []EntityMEventQuestSequenceGroup,
+	sequences []EntityMEventQuestSequence,
+) (map[int32][]int32, map[int32]map[int32][]int32, map[int32]map[int32][]int32) {
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].EventQuestSequenceGroupId != groups[j].EventQuestSequenceGroupId {
+			return groups[i].EventQuestSequenceGroupId < groups[j].EventQuestSequenceGroupId
+		}
+		if groups[i].DifficultyType != groups[j].DifficultyType {
+			return groups[i].DifficultyType < groups[j].DifficultyType
+		}
+		return groups[i].EventQuestSequenceId < groups[j].EventQuestSequenceId
+	})
+	sort.Slice(sequences, func(i, j int) bool {
+		if sequences[i].EventQuestSequenceId != sequences[j].EventQuestSequenceId {
+			return sequences[i].EventQuestSequenceId < sequences[j].EventQuestSequenceId
+		}
+		if sequences[i].SortOrder != sequences[j].SortOrder {
+			return sequences[i].SortOrder < sequences[j].SortOrder
+		}
+		return sequences[i].QuestId < sequences[j].QuestId
+	})
+
+	type sequenceRef struct {
+		id         int32
+		difficulty int32
+	}
+	sequencesByGroup := make(map[int32][]sequenceRef)
+	for _, row := range groups {
+		sequencesByGroup[row.EventQuestSequenceGroupId] = append(sequencesByGroup[row.EventQuestSequenceGroupId], sequenceRef{
+			id: row.EventQuestSequenceId, difficulty: row.DifficultyType,
+		})
+	}
+	questRowsBySequence := make(map[int32][]EntityMEventQuestSequence)
+	for _, row := range sequences {
+		questRowsBySequence[row.EventQuestSequenceId] = append(questRowsBySequence[row.EventQuestSequenceId], row)
+	}
+
+	questIdsByChapter := make(map[int32][]int32)
+	questIdsByChapterSortOrder := make(map[int32]map[int32][]int32)
+	questIdsByChapterDifficulty := make(map[int32]map[int32][]int32)
+	for _, chapter := range chapters {
+		seen := make(map[int32]bool)
+		seenBySortOrder := make(map[int32]map[int32]bool)
+		bySortOrder := make(map[int32][]int32)
+		seenByDifficulty := make(map[int32]map[int32]bool)
+		byDifficulty := make(map[int32][]int32)
+		for _, sequence := range sequencesByGroup[chapter.EventQuestSequenceGroupId] {
+			for _, row := range questRowsBySequence[sequence.id] {
+				if !seen[row.QuestId] {
+					seen[row.QuestId] = true
+					questIdsByChapter[chapter.EventQuestChapterId] = append(questIdsByChapter[chapter.EventQuestChapterId], row.QuestId)
+				}
+				if seenByDifficulty[sequence.difficulty] == nil {
+					seenByDifficulty[sequence.difficulty] = make(map[int32]bool)
+				}
+				if !seenByDifficulty[sequence.difficulty][row.QuestId] {
+					seenByDifficulty[sequence.difficulty][row.QuestId] = true
+					byDifficulty[sequence.difficulty] = append(byDifficulty[sequence.difficulty], row.QuestId)
+				}
+				if seenBySortOrder[row.SortOrder] == nil {
+					seenBySortOrder[row.SortOrder] = make(map[int32]bool)
+				}
+				if !seenBySortOrder[row.SortOrder][row.QuestId] {
+					seenBySortOrder[row.SortOrder][row.QuestId] = true
+					bySortOrder[row.SortOrder] = append(bySortOrder[row.SortOrder], row.QuestId)
+				}
+			}
+		}
+		if len(byDifficulty) > 0 {
+			questIdsByChapterDifficulty[chapter.EventQuestChapterId] = byDifficulty
+		}
+		if len(bySortOrder) > 0 {
+			questIdsByChapterSortOrder[chapter.EventQuestChapterId] = bySortOrder
+		}
+	}
+	return questIdsByChapter, questIdsByChapterSortOrder, questIdsByChapterDifficulty
 }
 
 func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
@@ -529,6 +617,17 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load event quest sequence group table: %w", err)
 	}
+	eventLimitRelations, err := utils.ReadTable[EntityMEventQuestChapterLimitContentRelation]("m_event_quest_chapter_limit_content_relation")
+	if err != nil {
+		return nil, fmt.Errorf("load event limit content relations: %w", err)
+	}
+	eventQuestIdsByChapterId, _, eventQuestIdsByChapterDifficulty := buildEventQuestIndexes(eventChapters, eventSequenceGroups, eventSequences)
+	limitContentQuestIds := make(map[int32]bool)
+	for _, relation := range eventLimitRelations {
+		for _, questId := range eventQuestIdsByChapterId[relation.EventQuestChapterId] {
+			limitContentQuestIds[questId] = true
+		}
+	}
 	memoirsByDisplayGroupId := make(map[int32][]int32)
 	for _, d := range eventDisplayItems {
 		if d.PossessionType == 4 { // PossessionTypeParts == memoirs
@@ -788,6 +887,28 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 		}
 	}
 
+	deckRestrictionRows, err := utils.ReadTable[EntityMQuestDeckRestrictionGroup]("m_quest_deck_restriction_group")
+	if err != nil {
+		return nil, fmt.Errorf("load quest deck restriction group: %w", err)
+	}
+	deckRestrictionsByGroupId := make(map[int32][]EntityMQuestDeckRestrictionGroup)
+	for _, row := range deckRestrictionRows {
+		deckRestrictionsByGroupId[row.QuestDeckRestrictionGroupId] = append(
+			deckRestrictionsByGroupId[row.QuestDeckRestrictionGroupId], row)
+	}
+
+	costumeProperAttrRows, err := utils.ReadTable[EntityMCostumeProperAttributeHpBonus]("m_costume_proper_attribute_hp_bonus")
+	if err != nil {
+		return nil, fmt.Errorf("load costume proper attribute: %w", err)
+	}
+	costumeProperAttributeByCostumeId := make(map[int32]int32, len(costumeProperAttrRows))
+	for _, row := range costumeProperAttrRows {
+		// First row wins; master data usually has one primary affinity per costume.
+		if _, exists := costumeProperAttributeByCostumeId[row.CostumeId]; !exists {
+			costumeProperAttributeByCostumeId[row.CostumeId] = row.CostumeProperAttributeType
+		}
+	}
+
 	return &QuestCatalog{
 		SceneById:                                 sceneById,
 		MissionById:                               missionById,
@@ -815,6 +936,11 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 		BattleOnlyTargetSceneByQuestId:            battleOnlyTargetSceneByQuestId,
 		MainQuestChapterIdByQuestId:               mainQuestChapterIdByQuestId,
 		EventQuestTypeByChapterId:                 eventQuestTypeByChapterId,
+		EventQuestIdsByChapterId:                  eventQuestIdsByChapterId,
+		EventQuestIdsByChapterDifficulty:          eventQuestIdsByChapterDifficulty,
+		LimitContentQuestIds:                      limitContentQuestIds,
+		DeckRestrictionsByGroupId:                 deckRestrictionsByGroupId,
+		CostumeProperAttributeByCostumeId:        costumeProperAttributeByCostumeId,
 		DarkMemoryQuestIds:                        darkMemoryQuestIds,
 		ChapterMemoirsByQuestId:                   chapterMemoirsByQuestId,
 		QuestMissionConditionValueGroupsByGroupId: questMissionConditionValueGroupsByGroupId,
@@ -853,4 +979,35 @@ func LoadQuestCatalog(partsCatalog *PartsCatalog) (*QuestCatalog, error) {
 func (q *QuestCatalog) BattleOnlyTargetSceneIdFor(questId int32) (int32, bool) {
 	v, ok := q.BattleOnlyTargetSceneByQuestId[questId]
 	return v, ok
+}
+
+
+// QuestHasAffinityRestriction reports whether the quest requires a proper
+// attribute (affinity) on any deck slot (QuestDeckRestrictionType = 3).
+func (c *QuestCatalog) QuestHasAffinityRestriction(questId int32) bool {
+	if c == nil {
+		return false
+	}
+	quest, ok := c.QuestById[questId]
+	if !ok || quest.QuestDeckRestrictionGroupId == 0 {
+		return false
+	}
+	for _, row := range c.DeckRestrictionsByGroupId[quest.QuestDeckRestrictionGroupId] {
+		if row.QuestDeckRestrictionType == QuestDeckRestrictionTypeProperAttributeType {
+			return true
+		}
+	}
+	return false
+}
+
+// DeckRestrictionsForQuest returns slot restrictions for a quest (may be empty).
+func (c *QuestCatalog) DeckRestrictionsForQuest(questId int32) []EntityMQuestDeckRestrictionGroup {
+	if c == nil {
+		return nil
+	}
+	quest, ok := c.QuestById[questId]
+	if !ok || quest.QuestDeckRestrictionGroupId == 0 {
+		return nil
+	}
+	return c.DeckRestrictionsByGroupId[quest.QuestDeckRestrictionGroupId]
 }

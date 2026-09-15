@@ -2,10 +2,17 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"slices"
 
+	"github.com/google/uuid"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	pb "lunar-tear/server/gen/proto"
 	"lunar-tear/server/internal/gametime"
+	"lunar-tear/server/internal/masterdata"
 	"lunar-tear/server/internal/model"
 	"lunar-tear/server/internal/questflow"
 	"lunar-tear/server/internal/store"
@@ -17,18 +24,30 @@ func (s *QuestServiceServer) StartEventQuest(ctx context.Context, req *pb.StartE
 	log.Printf("[QuestService] StartEventQuest: chapterId=%d questId=%d isBattleOnly=%v maxAutoOrbitCount=%d",
 		req.EventQuestChapterId, req.QuestId, req.IsBattleOnly, req.MaxAutoOrbitCount)
 
-	engine := s.holder.Get().QuestHandler
+	cat := s.holder.Get()
+	engine := cat.QuestHandler
 	userId := CurrentUserId(ctx, s.users, s.sessions)
 	nowMillis := gametime.NowMillis()
+	var validationErr error
 	s.users.UpdateUser(userId, func(user *store.UserState) {
+		if err := validateLimitContentDeck(user, cat.LimitContent, cat.Quest, req.EventQuestChapterId, req.QuestId, req.UserDeckNumber, nowMillis); err != nil {
+			validationErr = err
+			return
+		}
+		if err := validateQuestDeckRestrictions(user, cat.Quest, req.QuestId, req.UserDeckNumber); err != nil {
+			validationErr = err
+			return
+		}
 		engine.HandleEventQuestStart(user, req.EventQuestChapterId, req.QuestId, req.IsBattleOnly, req.UserDeckNumber, nowMillis)
 		startAutoOrbit(user, model.QuestTypeEvent, req.EventQuestChapterId, req.QuestId, req.MaxAutoOrbitCount, nowMillis)
-		// Track stamina usage for missions (even though stamina is free on this server)
 		staminaCost := engine.EventQuestStaminaCost(req.EventQuestChapterId, req.QuestId, nowMillis)
 		if staminaCost > 0 {
-			ApplyMissionProgressEvent(user, s.holder.Get().Mission, MissionProgressEvent{ConditionType: missionConditionStaminaUsed, Delta: staminaCost}, nowMillis)
+			ApplyMissionProgressEvent(user, cat.Mission, MissionProgressEvent{ConditionType: missionConditionStaminaUsed, Delta: staminaCost}, nowMillis)
 		}
 	})
+	if validationErr != nil {
+		return nil, validationErr
+	}
 
 	drops := engine.BattleDropRewards(req.QuestId)
 	pbDrops := make([]*pb.BattleDropReward, len(drops))
@@ -50,50 +69,59 @@ func (s *QuestServiceServer) FinishEventQuest(ctx context.Context, req *pb.Finis
 		req.EventQuestChapterId, req.QuestId, req.IsRetired, req.IsAnnihilated, req.IsAutoOrbit)
 
 	nowMillis := gametime.NowMillis()
-	engine := s.holder.Get().QuestHandler
+	cat := s.holder.Get()
+	engine := cat.QuestHandler
 	userId := CurrentUserId(ctx, s.users, s.sessions)
 	var outcome questflow.FinishOutcome
 	var endedDrops []store.AutoOrbitDropEntry
 	var loopEnded bool
+	var validationErr error
 	s.users.UpdateUser(userId, func(user *store.UserState) {
-		log.Printf("[QuestService] FinishEventQuest: MARKER_A - about to call HandleEventQuestFinish")
+		deckNumber := user.Quests[req.QuestId].UserDeckNumber
+		if !req.IsRetired && !req.IsAnnihilated {
+			if err := validateLimitContentDeck(user, cat.LimitContent, cat.Quest, req.EventQuestChapterId, req.QuestId, deckNumber, nowMillis); err != nil {
+				validationErr = err
+				return
+			}
+		}
+
 		outcome = engine.HandleEventQuestFinish(user, req.EventQuestChapterId, req.QuestId, req.IsRetired, req.IsAnnihilated, nowMillis)
-		log.Printf("[QuestService] FinishEventQuest: MARKER_B - returned from HandleEventQuestFinish, user.Battle.LastComboCount=%d", user.Battle.LastComboCount)
+
+		if !req.IsRetired && !req.IsAnnihilated {
+			if err := recordLimitContentDeck(user, cat.LimitContent, cat.Quest, req.EventQuestChapterId, req.QuestId, deckNumber, nowMillis); err != nil {
+				validationErr = err
+				return
+			}
+			releaseClearedLimitContentDifficultyDecks(user, cat.Quest, req.EventQuestChapterId, req.QuestId)
+		}
+
 		endedDrops, loopEnded = finishAutoOrbit(user, req.IsAutoOrbit, req.IsRetired, req.IsAnnihilated, model.QuestTypeEvent, req.EventQuestChapterId, req.QuestId, nowMillis, outcome.DropRewards)
 
-		log.Printf("[QuestService] FinishEventQuest: LoadUser result - LastComboCount=%d, LastComboMaxDamage=%d (BEFORE any updates)", user.Battle.LastComboCount, user.Battle.LastComboMaxDamage)
-
-		// Track quit/retire and party wipe for missions
 		if req.IsRetired && !req.IsAnnihilated {
-			ApplyMissionProgressEvent(user, s.holder.Get().Mission, MissionProgressEvent{ConditionType: missionConditionQuitBattle, Delta: 1}, nowMillis)
+			ApplyMissionProgressEvent(user, cat.Mission, MissionProgressEvent{ConditionType: missionConditionQuitBattle, Delta: 1}, nowMillis)
 		}
 		if req.IsAnnihilated {
-			ApplyMissionProgressEvent(user, s.holder.Get().Mission, MissionProgressEvent{ConditionType: missionConditionPartyWipe, Delta: 1}, nowMillis)
+			ApplyMissionProgressEvent(user, cat.Mission, MissionProgressEvent{ConditionType: missionConditionPartyWipe, Delta: 1}, nowMillis)
 		}
 
-		log.Printf("[QuestService] FinishEventQuest: condition check - IsRetired=%v, IsAnnihilated=%v, will check missions=%v", req.IsRetired, req.IsAnnihilated, !req.IsRetired && !req.IsAnnihilated)
 		if !req.IsRetired && !req.IsAnnihilated {
-			log.Printf("[QuestService] FinishEventQuest: before mission check - LastComboCount=%d, LastComboMaxDamage=%d", user.Battle.LastComboCount, user.Battle.LastComboMaxDamage)
-			ApplyQuestClearMissionProgress(user, s.holder.Get().Mission, model.QuestTypeEvent, req.QuestId, req.EventQuestChapterId, nowMillis)
-			ApplyMissionProgressEvent(user, s.holder.Get().Mission, MissionProgressEvent{
+			ApplyQuestClearMissionProgress(user, cat.Mission, model.QuestTypeEvent, req.QuestId, req.EventQuestChapterId, nowMillis)
+			ApplyMissionProgressEvent(user, cat.Mission, MissionProgressEvent{
 				ConditionType: missionConditionPlayerLevel,
 				CurrentValue:  user.Status.Level,
 			}, nowMillis)
-
-			// Update boss defeat missions (type 35 - for missions 220001-220022)
-			if n := questBossCount(s.holder.Get().Quest, req.QuestId); n > 0 {
-				log.Printf("[QuestService] EventQuest %d has %d boss(es) (BattleEnemyType=2)", req.QuestId, n)
-				ApplyMissionProgressEvent(user, s.holder.Get().Mission, MissionProgressEvent{
+			if n := questBossCount(cat.Quest, req.QuestId); n > 0 {
+				ApplyMissionProgressEvent(user, cat.Mission, MissionProgressEvent{
 					ConditionType: missionConditionBossDefeat,
 					Delta:         n,
 				}, nowMillis)
 			}
-
-			// Hidden-story quest-clear missions (category 7): character-in-
-			// loadout counters, dungeon clears and Dark Memory quests.
-			ApplyHiddenStoryQuestClearMissionProgress(user, s.holder.Get().Mission, s.holder.Get().Quest, req.QuestId, nowMillis)
+			ApplyHiddenStoryQuestClearMissionProgress(user, cat.Mission, cat.Quest, req.QuestId, nowMillis)
 		}
 	})
+	if validationErr != nil {
+		return nil, validationErr
+	}
 
 	autoOrbitReward := emptyAutoOrbitReward()
 	if loopEnded {
@@ -111,6 +139,263 @@ func (s *QuestServiceServer) FinishEventQuest(ctx context.Context, req *pb.Finis
 		UserStatusCampaignReward:        []*pb.QuestReward{},
 		AutoOrbitReward:                 autoOrbitReward,
 	}, nil
+}
+
+// releaseClearedLimitContentDifficultyDecks clears costume/weapon usage locks
+// for a difficulty once every quest in that difficulty is cleared.
+func releaseClearedLimitContentDifficultyDecks(user *store.UserState, catalog *masterdata.QuestCatalog, chapterId, questId int32) {
+	if catalog == nil || !catalog.LimitContentQuestIds[questId] {
+		return
+	}
+	for _, questIds := range catalog.EventQuestIdsByChapterDifficulty[chapterId] {
+		if !slices.Contains(questIds, questId) {
+			continue
+		}
+		for _, id := range questIds {
+			if user.Quests[id].QuestStateType != model.UserQuestStateTypeCleared {
+				return
+			}
+		}
+		for id, restricted := range user.DeckLimitContentRestricted {
+			if restricted.EventQuestChapterId == chapterId && slices.Contains(questIds, restricted.QuestId) {
+				delete(user.DeckLimitContentRestricted, id)
+			}
+		}
+		return
+	}
+}
+
+type limitContentDeckTarget struct {
+	possessionType int32
+	uuid           string
+}
+
+func limitContentDeckTargets(user *store.UserState, deckNumber int32) ([]limitContentDeckTarget, error) {
+	deck, ok := user.Decks[store.DeckKey{DeckType: model.DeckTypeRestrictedLimitContentQuest, UserDeckNumber: deckNumber}]
+	if !ok {
+		return nil, status.Error(codes.FailedPrecondition, "limit-content deck does not exist")
+	}
+	deckCharacterUuids := []string{deck.UserDeckCharacterUuid01, deck.UserDeckCharacterUuid02, deck.UserDeckCharacterUuid03}
+	var targets []limitContentDeckTarget
+	seen := make(map[string]bool)
+	add := func(possessionType int32, targetUuid string) {
+		key := fmt.Sprintf("%d:%s", possessionType, targetUuid)
+		if targetUuid != "" && !seen[key] {
+			seen[key] = true
+			targets = append(targets, limitContentDeckTarget{possessionType, targetUuid})
+		}
+	}
+	for _, deckCharacterUuid := range deckCharacterUuids {
+		if deckCharacterUuid == "" {
+			continue
+		}
+		character, ok := user.DeckCharacters[deckCharacterUuid]
+		if !ok {
+			return nil, status.Error(codes.FailedPrecondition, "limit-content deck contains an unknown character")
+		}
+		if character.UserCostumeUuid == "" {
+			return nil, status.Error(codes.FailedPrecondition, "limit-content deck character has no costume")
+		}
+		if _, ok := user.Costumes[character.UserCostumeUuid]; !ok {
+			return nil, status.Error(codes.FailedPrecondition, "limit-content deck contains an unknown costume")
+		}
+		if character.MainUserWeaponUuid == "" {
+			return nil, status.Error(codes.FailedPrecondition, "limit-content deck character has no main weapon")
+		}
+		if _, ok := user.Weapons[character.MainUserWeaponUuid]; !ok {
+			return nil, status.Error(codes.FailedPrecondition, "limit-content deck contains an unknown main weapon")
+		}
+		add(int32(model.PossessionTypeCostume), character.UserCostumeUuid)
+		add(int32(model.PossessionTypeWeapon), character.MainUserWeaponUuid)
+		for _, weaponUuid := range user.DeckSubWeapons[deckCharacterUuid] {
+			if _, ok := user.Weapons[weaponUuid]; !ok {
+				return nil, status.Error(codes.FailedPrecondition, "limit-content deck contains an unknown sub weapon")
+			}
+			add(int32(model.PossessionTypeWeapon), weaponUuid)
+		}
+	}
+	if len(targets) == 0 {
+		return nil, status.Error(codes.FailedPrecondition, "limit-content deck is empty")
+	}
+	return targets, nil
+}
+
+func restrictionPossessionType(restrictionType int32) int32 {
+	if restrictionType == masterdata.LimitContentDeckRestrictionTypeCostume {
+		return int32(model.PossessionTypeCostume)
+	}
+	if restrictionType == masterdata.LimitContentDeckRestrictionTypeWeapon {
+		return int32(model.PossessionTypeWeapon)
+	}
+	return 0
+}
+
+// shouldLockWeapons: official rule — on floors/quests with required affinities,
+// weapons alone may be reused within the floor. Skip weapon lock/validate then.
+func shouldLockWeapons(questCatalog *masterdata.QuestCatalog, questId int32) bool {
+	if questCatalog == nil {
+		return true
+	}
+	// Affinity-required quest => weapons are reusable.
+	if questCatalog.QuestHasAffinityRestriction(questId) {
+		return false
+	}
+	return true
+}
+
+func validateLimitContentDeck(user *store.UserState, limitCat *masterdata.LimitContentCatalog, questCat *masterdata.QuestCatalog, chapterId, questId, deckNumber int32, nowMillis int64) error {
+	if limitCat == nil {
+		return nil
+	}
+	restrictedTypes := limitCat.ActiveRestrictionTypes(chapterId, nowMillis)
+	if len(restrictedTypes) == 0 {
+		return nil
+	}
+	if _, ok := user.Decks[store.DeckKey{DeckType: model.DeckTypeRestrictedLimitContentQuest, UserDeckNumber: deckNumber}]; !ok {
+		return nil
+	}
+	targets, err := limitContentDeckTargets(user, deckNumber)
+	if err != nil {
+		return err
+	}
+	lockWeapons := shouldLockWeapons(questCat, questId)
+	for _, restrictionType := range restrictedTypes {
+		if restrictionType == masterdata.LimitContentDeckRestrictionTypeWeapon && !lockWeapons {
+			continue
+		}
+		possessionType := restrictionPossessionType(restrictionType)
+		for _, target := range targets {
+			if target.possessionType != possessionType {
+				continue
+			}
+			for _, used := range user.DeckLimitContentRestricted {
+				if used.EventQuestChapterId == chapterId && used.PossessionType == possessionType && used.TargetUuid == target.uuid {
+					return status.Error(codes.FailedPrecondition, "deck contains content already used in this limit quest")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func recordLimitContentDeck(user *store.UserState, limitCat *masterdata.LimitContentCatalog, questCat *masterdata.QuestCatalog, chapterId, questId, deckNumber int32, nowMillis int64) error {
+	if limitCat == nil {
+		return nil
+	}
+	restrictionTypes := limitCat.ActiveRestrictionTypes(chapterId, nowMillis)
+	if len(restrictionTypes) == 0 {
+		return nil
+	}
+	if _, ok := user.Decks[store.DeckKey{DeckType: model.DeckTypeRestrictedLimitContentQuest, UserDeckNumber: deckNumber}]; !ok {
+		return nil
+	}
+	targets, err := limitContentDeckTargets(user, deckNumber)
+	if err != nil {
+		return err
+	}
+	if user.DeckLimitContentRestricted == nil {
+		user.DeckLimitContentRestricted = make(map[string]store.DeckLimitContentRestrictedState)
+	}
+	lockWeapons := shouldLockWeapons(questCat, questId)
+	for _, restrictionType := range restrictionTypes {
+		if restrictionType == masterdata.LimitContentDeckRestrictionTypeWeapon && !lockWeapons {
+			continue
+		}
+		possessionType := restrictionPossessionType(restrictionType)
+		for _, target := range targets {
+			if target.possessionType != possessionType {
+				continue
+			}
+			alreadyRecorded := false
+			for _, used := range user.DeckLimitContentRestricted {
+				if used.EventQuestChapterId == chapterId && used.PossessionType == possessionType && used.TargetUuid == target.uuid {
+					alreadyRecorded = true
+					break
+				}
+			}
+			if alreadyRecorded {
+				continue
+			}
+			id := uuid.NewString()
+			user.DeckLimitContentRestricted[id] = store.DeckLimitContentRestrictedState{
+				DeckRestrictedUuid:  id,
+				EventQuestChapterId: chapterId,
+				QuestId:             questId,
+				PossessionType:      possessionType,
+				TargetUuid:          target.uuid,
+				LatestVersion:       nowMillis,
+			}
+		}
+	}
+	return nil
+}
+
+// validateQuestDeckRestrictions enforces required characters / costumes / affinities
+// from m_quest_deck_restriction_group (QuestDeckRestrictionType).
+func validateQuestDeckRestrictions(user *store.UserState, catalog *masterdata.QuestCatalog, questId, deckNumber int32) error {
+	if catalog == nil {
+		return nil
+	}
+	restrictions := catalog.DeckRestrictionsForQuest(questId)
+	if len(restrictions) == 0 {
+		return nil
+	}
+	deck, ok := user.Decks[store.DeckKey{DeckType: model.DeckTypeRestrictedLimitContentQuest, UserDeckNumber: deckNumber}]
+	if !ok {
+		// Also accept normal quest decks if client used them.
+		deck, ok = user.Decks[store.DeckKey{DeckType: model.DeckTypeQuest, UserDeckNumber: deckNumber}]
+		if !ok {
+			return status.Error(codes.FailedPrecondition, "deck does not exist for restriction check")
+		}
+	}
+	slots := []string{deck.UserDeckCharacterUuid01, deck.UserDeckCharacterUuid02, deck.UserDeckCharacterUuid03}
+
+	for _, row := range restrictions {
+		if row.QuestDeckRestrictionType == masterdata.QuestDeckRestrictionTypeForbidden {
+			continue
+		}
+		// SlotNumber is 1-based in master data.
+		slotIdx := int(row.SlotNumber - 1)
+		if slotIdx < 0 || slotIdx >= len(slots) {
+			continue
+		}
+		dcUuid := slots[slotIdx]
+		if dcUuid == "" {
+			return status.Errorf(codes.FailedPrecondition, "deck slot %d is empty but required", row.SlotNumber)
+		}
+		dc, ok := user.DeckCharacters[dcUuid]
+		if !ok {
+			return status.Errorf(codes.FailedPrecondition, "deck slot %d has unknown character", row.SlotNumber)
+		}
+		costume, ok := user.Costumes[dc.UserCostumeUuid]
+		if !ok {
+			return status.Errorf(codes.FailedPrecondition, "deck slot %d has unknown costume", row.SlotNumber)
+		}
+		masterCostume, ok := catalog.CostumeById[costume.CostumeId]
+		if !ok {
+			return status.Errorf(codes.FailedPrecondition, "deck slot %d costume not in master data", row.SlotNumber)
+		}
+
+		switch row.QuestDeckRestrictionType {
+		case masterdata.QuestDeckRestrictionTypeCharacterId:
+			if masterCostume.CharacterId != row.RestrictionValue {
+				return status.Errorf(codes.FailedPrecondition,
+					"deck slot %d requires character %d", row.SlotNumber, row.RestrictionValue)
+			}
+		case masterdata.QuestDeckRestrictionTypeCostumeId:
+			if costume.CostumeId != row.RestrictionValue {
+				return status.Errorf(codes.FailedPrecondition,
+					"deck slot %d requires costume %d", row.SlotNumber, row.RestrictionValue)
+			}
+		case masterdata.QuestDeckRestrictionTypeProperAttributeType:
+			attr, ok := catalog.CostumeProperAttributeByCostumeId[costume.CostumeId]
+			if !ok || attr != row.RestrictionValue {
+				return status.Errorf(codes.FailedPrecondition,
+					"deck slot %d requires affinity %d", row.SlotNumber, row.RestrictionValue)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *QuestServiceServer) RestartEventQuest(ctx context.Context, req *pb.RestartEventQuestRequest) (*pb.RestartEventQuestResponse, error) {

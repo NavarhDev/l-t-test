@@ -62,6 +62,7 @@ type UserState struct {
 	SideStoryQuests         map[int32]SideStoryQuestProgress
 	SideStoryActiveProgress SideStoryActiveProgress
 	QuestLimitContentStatus map[int32]QuestLimitContentStatus
+	DeckLimitContentRestricted map[string]DeckLimitContentRestrictedState
 
 	BigHuntProgress          BigHuntProgress
 	BigHuntMaxScores         map[int32]BigHuntMaxScore
@@ -198,6 +199,9 @@ func (u *UserState) EnsureMaps() {
 	}
 	if u.QuestLimitContentStatus == nil {
 		u.QuestLimitContentStatus = make(map[int32]QuestLimitContentStatus)
+	}
+	if u.DeckLimitContentRestricted == nil {
+		u.DeckLimitContentRestricted = make(map[string]DeckLimitContentRestrictedState)
 	}
 	if u.BigHuntMaxScores == nil {
 		u.BigHuntMaxScores = make(map[int32]BigHuntMaxScore)
@@ -700,6 +704,15 @@ type QuestLimitContentStatus struct {
 	LimitContentQuestStatusType int32
 	EventQuestChapterId         int32
 	LatestVersion               int64
+}
+
+type DeckLimitContentRestrictedState struct {
+	DeckRestrictedUuid  string
+	EventQuestChapterId int32
+	QuestId             int32
+	PossessionType      int32
+	TargetUuid          string
+	LatestVersion       int64
 }
 
 type BigHuntProgress struct {

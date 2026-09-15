@@ -38,6 +38,11 @@ func buildCatalogs() (*Catalogs, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load quest catalog: %w", err)
 	}
+	limitContentCatalog, err := masterdata.LoadLimitContentCatalog()
+	if err != nil {
+		return nil, fmt.Errorf("load limit content catalog: %w", err)
+	}
+	log.Printf("limit content catalog loaded: %d chapters", len(limitContentCatalog.ContentsByChapter))
 	sideStoryCatalog := masterdata.LoadSideStoryCatalog()
 	campaignCatalog, err := campaign.Load()
 	if err != nil {
@@ -410,6 +415,7 @@ func buildCatalogs() (*Catalogs, error) {
 		GameConfig:        gameConfig,
 		Parts:             partsCatalog,
 		Quest:             questCatalog,
+		LimitContent:      limitContentCatalog,
 		GachaEntries:      gachaEntries,
 		GachaMedals:       medalInfo,
 		GachaPool:         gachaPool,
