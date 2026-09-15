@@ -9,9 +9,13 @@ import (
 )
 
 func (h *QuestHandler) HandleExtraQuestStart(user *store.UserState, questId, userDeckNumber int32, nowMillis int64) {
-	_, ok := h.QuestById[questId]
+	quest, ok := h.QuestById[questId]
 	if !ok {
 		panic(fmt.Sprintf("unknown questId=%d for HandleExtraQuestStart", questId))
+	}
+	if !h.QuestReleased(user, quest) {
+		log.Printf("[HandleExtraQuestStart] quest %d is locked by release conditions", questId)
+		return
 	}
 
 	h.initQuestState(user, questId)
@@ -52,12 +56,13 @@ func (h *QuestHandler) HandleExtraQuestFinish(user *store.UserState, questId int
 		outcome = h.evaluateFinishOutcome(user, questId, target, nowMillis, oldMissionStates)
 		h.applyQuestVictory(user, questId, target, &outcome, nowMillis, false)
 	} else {
-		// Reset quest state to Unknown on retire/annihilate to prevent blocking
+		// On retire/annihilate: keep Cleared if already cleared once, otherwise
+		// mark Challenged so dependent quests (e.g. linked Scarecrow) can unlock.
 		questState := user.Quests[questId]
 		if questState.ClearCount > 0 {
 			questState.QuestStateType = model.UserQuestStateTypeCleared
 		} else {
-			questState.QuestStateType = model.UserQuestStateTypeUnknown
+			questState.QuestStateType = model.UserQuestStateTypeChallenged
 		}
 		questState.LatestVersion = nowMillis
 		user.Quests[questId] = questState
